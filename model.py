@@ -1,4 +1,7 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # GPU 0만 인식되도록 제한
+
+
 from pathlib import Path
 import hashlib, fcntl
 from concurrent.futures import ThreadPoolExecutor
@@ -80,8 +83,8 @@ class QwenVLAForAction(nn.Module):
             flash_attention_2 → sdpa → default
         """
 
-        dtype_candidates = [torch.float16] # torch.bfloat16, 
-        attn_candidates = ["sdpa"] # "flash_attention_2", 
+        dtype_candidates = [torch.bfloat16, torch.float16] # 
+        attn_candidates = ["flash_attention_2", "sdpa"] #  
 
         for dtype in dtype_candidates:
             for impl in attn_candidates:
@@ -91,7 +94,7 @@ class QwenVLAForAction(nn.Module):
                         vl_model_name,
                         dtype=dtype,
                         attn_implementation=impl,
-                        device_map="auto",
+                        device_map="cuda",
                         low_cpu_mem_usage=True,
                     )
                     print(f"✅ Successfully loaded with {impl} ({dtype})")
@@ -110,7 +113,7 @@ class QwenVLAForAction(nn.Module):
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     vl_model_name,
                     dtype=dtype,
-                    device_map="auto",
+                    device_map="cuda",
                     low_cpu_mem_usage=True,
                 )
                 print(f"✅ Successfully loaded with default attention ({dtype})")

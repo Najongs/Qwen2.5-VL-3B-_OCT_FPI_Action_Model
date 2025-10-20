@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from transformers import AutoProcessor
 
 # 로컬 모듈 경로 추가
-sys.path.append("/home/zed_box/NAS/Qwen2.5-VL-3B-_OCT_FPI_Action_Model")
+sys.path.append("/home/najo/NAS/VLA/Qwen2.5-VL-3B-_OCT_FPI_Action_Model")
 
 from model import QwenVLAForAction
 from Total_Dataset import BridgeRawSequenceDataset, collate_fn  # (호환성 유지용)
@@ -54,7 +54,7 @@ print("✅ Model loaded and frozen.\n")
 processor = AutoProcessor.from_pretrained(VL_MODEL_NAME)
 
 # 테스트용 이미지
-image_path = "/home/zed_box/NAS/VLA_make_the_dataset/dataset/part2/ZED_Captures_11th/view1/zed_41182735_left_1759125181.869.jpg"
+image_path = "/home/najo/NAS/VLA/dataset/part1/ZED_Captures_2th/view1/left/zed_41182735_left_1759119936.930.jpg"
 image = Image.open(image_path).convert("RGB")
 
 instruction = "Move the gripper towards the white block."

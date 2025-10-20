@@ -2,7 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+recv_all/
 checkpoints*/
 cache/
 
