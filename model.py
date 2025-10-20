@@ -54,14 +54,8 @@ class QwenVLAForAction(nn.Module):
         self.cache_enabled = True
 
         self.processor = AutoProcessor.from_pretrained(vl_model_name)
-        self.vl_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            vl_model_name,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map="cuda",
-            low_cpu_mem_usage=True,
-        )
-
+        self.vl_model = self._load_qwen_with_fallback(vl_model_name)
+        
         self.action_expert = QwenActionExpert(
             vl_dim=self.vl_model.config.hidden_size,
             action_dim=action_dim,
@@ -74,6 +68,59 @@ class QwenVLAForAction(nn.Module):
         for p in self.vl_model.parameters():
             p.requires_grad = False
         print("✅ Frozen.")
+        
+    # ============================================================
+    # ⚙️ Qwen-VL 로더: FlashAttention2 → SDPA → Default (with dtype fallback)
+    # ============================================================
+    def _load_qwen_with_fallback(self, vl_model_name):
+        """
+        1️⃣ bfloat16 우선 시도 (성능↑)
+        2️⃣ float16로 폴백 (Jetson 안정성↑)
+        3️⃣ Attention backend 순서:
+            flash_attention_2 → sdpa → default
+        """
+
+        dtype_candidates = [torch.float16] # torch.bfloat16, 
+        attn_candidates = ["sdpa"] # "flash_attention_2", 
+
+        for dtype in dtype_candidates:
+            for impl in attn_candidates:
+                try:
+                    print(f"🧠 Trying attn_implementation={impl} with dtype={dtype} ...")
+                    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        vl_model_name,
+                        dtype=dtype,
+                        attn_implementation=impl,
+                        device_map="auto",
+                        low_cpu_mem_usage=True,
+                    )
+                    print(f"✅ Successfully loaded with {impl} ({dtype})")
+                    self.attn_backend = impl
+                    self.model_dtype = dtype
+                    return model
+                except Exception as e:
+                    print(f"⚠️ {impl} ({dtype}) failed: {e}")
+
+        # ============================================================
+        # 🧠 최종 fallback: attention 지정 없이 기본 로드
+        # ============================================================
+        for dtype in dtype_candidates:
+            try:
+                print(f"🧠 Trying default attention (no impl) with dtype={dtype} ...")
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    vl_model_name,
+                    dtype=dtype,
+                    device_map="auto",
+                    low_cpu_mem_usage=True,
+                )
+                print(f"✅ Successfully loaded with default attention ({dtype})")
+                self.attn_backend = "default"
+                self.model_dtype = dtype
+                return model
+            except Exception as e:
+                print(f"⚠️ Default ({dtype}) failed: {e}")
+
+        raise RuntimeError("❌ All dtype/attention fallback attempts failed.")
 
     def set_cache(self, enabled: bool = True):
         self.cache_enabled = enabled
@@ -208,15 +255,10 @@ class Not_freeze_QwenVLAForAction(nn.Module):
         # =============================
         # 1️⃣ Qwen-VL backbone 로딩
         # =============================
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.processor = AutoProcessor.from_pretrained(vl_model_name)
-        self.vl_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            vl_model_name,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            device_map={"": local_rank},
-            low_cpu_mem_usage=True,
-        )
+        
+        # ✅ FlashAttention2 → 실패 시 xFormers 폴백
+        self.vl_model = self._load_qwen_with_fallback(vl_model_name)
 
         # =============================
         # 2️⃣ Action Expert
@@ -247,6 +289,60 @@ class Not_freeze_QwenVLAForAction(nn.Module):
             self.cache_mode = "off"   # LoRA 학습 중에는 항상 end-to-end로 인코딩
         else:
             self.cache_mode = "on"    # Frozen일 때만 lazy cache 허용
+            
+    # ============================================================
+    # ⚙️ Qwen-VL 로더: FlashAttention2 → SDPA → Default (with dtype fallback)
+    # ============================================================
+    def _load_qwen_with_fallback(self, vl_model_name):
+        """
+        1️⃣ bfloat16 우선 시도 (성능↑)
+        2️⃣ float16로 폴백 (Jetson 안정성↑)
+        3️⃣ Attention backend 순서:
+            flash_attention_2 → sdpa → default
+        """
+
+        dtype_candidates = [torch.bfloat16, torch.float16]
+        attn_candidates = ["flash_attention_2", "sdpa"]
+
+        for dtype in dtype_candidates:
+            for impl in attn_candidates:
+                try:
+                    print(f"🧠 Trying attn_implementation={impl} with dtype={dtype} ...")
+                    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                        vl_model_name,
+                        dtype=dtype,
+                        attn_implementation=impl,
+                        device_map="auto",
+                        low_cpu_mem_usage=True,
+                    )
+                    print(f"✅ Successfully loaded with {impl} ({dtype})")
+                    self.attn_backend = impl
+                    self.model_dtype = dtype
+                    return model
+                except Exception as e:
+                    print(f"⚠️ {impl} ({dtype}) failed: {e}")
+
+        # ============================================================
+        # 🧠 최종 fallback: attention 지정 없이 기본 로드
+        # ============================================================
+        for dtype in dtype_candidates:
+            try:
+                print(f"🧠 Trying default attention (no impl) with dtype={dtype} ...")
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    vl_model_name,
+                    dtype=dtype,
+                    device_map="auto",
+                    low_cpu_mem_usage=True,
+                )
+                print(f"✅ Successfully loaded with default attention ({dtype})")
+                self.attn_backend = "default"
+                self.model_dtype = dtype
+                return model
+            except Exception as e:
+                print(f"⚠️ Default ({dtype}) failed: {e}")
+
+        raise RuntimeError("❌ All dtype/attention fallback attempts failed.")
+
 
     # =============================
     # LoRA 및 selective unfreeze 부분 동일
