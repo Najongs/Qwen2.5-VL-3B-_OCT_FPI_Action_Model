@@ -5,6 +5,7 @@ __pycache__/
 recv_all/
 checkpoints*/
 cache/
+dataset/
 
 # C extensions
 *.so
