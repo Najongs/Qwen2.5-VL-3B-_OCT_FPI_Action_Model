@@ -51,6 +51,7 @@ class QwenVLAForAction(nn.Module):
 
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)  # ✅ 디렉토리 생성
+        self.cache_enabled = True
 
         self.processor = AutoProcessor.from_pretrained(vl_model_name)
         self.vl_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -73,6 +74,9 @@ class QwenVLAForAction(nn.Module):
         for p in self.vl_model.parameters():
             p.requires_grad = False
         print("✅ Frozen.")
+
+    def set_cache(self, enabled: bool = True):
+        self.cache_enabled = enabled
 
     def _cache_path(self, key: str, txt: str, views: list[str | None]) -> Path:
         vlist = [v for v in views if v is not None]
@@ -104,48 +108,56 @@ class QwenVLAForAction(nn.Module):
                 f.unlink(missing_ok=True)
             print(f"⚠️ Cache limit exceeded. Trimmed to {max_gb}GB.")
 
-    def forward(self, text_inputs, image_inputs, z_chunk, cache_keys=None):
+    def forward(self, text_inputs, image_inputs, z_chunk, cache_keys=None, cache: bool = True):
         device = next(self.parameters()).device
+        use_cache = bool(cache and self.cache_enabled)
 
         if cache_keys is None:
             cache_keys = [f"idx={i}" for i in range(len(text_inputs))]
 
+        # 캐시를 쓰는 경우에만 HIT/MISS 검사
         pooled_vl_tokens_dict = {}
-
-        # --- 1️⃣ 캐시 HIT ---
         miss_items = []
-        for txt, views, key in zip(text_inputs, image_inputs, cache_keys):
-            cache_path = self._cache_path(key, txt, views)
-            if cache_path.exists():
-                pooled = torch.load(cache_path, map_location="cpu")
-                pooled = pooled.pin_memory().to(device=device, non_blocking=True, dtype=torch.bfloat16)
-                pooled_vl_tokens_dict[key] = pooled
-            else:
-                miss_items.append((txt, views, key))
 
-        # --- 2️⃣ 캐시 MISS: 병렬 전처리 ---
+        if use_cache:
+            for txt, views, key in zip(text_inputs, image_inputs, cache_keys):
+                cache_path = self._cache_path(key, txt, views)
+                if cache_path.exists():
+                    pooled = torch.load(cache_path, map_location="cpu")
+                    pooled = pooled.pin_memory().to(device=device, non_blocking=True, dtype=torch.bfloat16)
+                    pooled_vl_tokens_dict[key] = pooled
+                else:
+                    miss_items.append((txt, views, key))
+        else:
+            # 캐시 OFF이면 모든 항목을 miss로 간주하여 한 번에 처리
+            miss_items = list(zip(text_inputs, image_inputs, cache_keys))
+
+        # 전처리 함수(공용)
+        def preprocess_message(args):
+            txt, views, key = args
+            msg_content = [{"type": "image", "image": v} for v in views if v is not None]
+            msg_content.append({"type": "text", "text": txt})
+            messages = [{"role": "user", "content": msg_content}]
+            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            vision_inputs, video_inputs = process_vision_info(messages)
+            return key, txt, views, text, vision_inputs, video_inputs
+
         if miss_items:
-            def preprocess_message(args):
-                txt, views, key = args
-                msg_content = [{"type": "image", "image": v} for v in views if v is not None]
-                msg_content.append({"type": "text", "text": txt})
-                messages = [{"role": "user", "content": msg_content}]
-                text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-                vision_inputs, video_inputs = process_vision_info(messages)
-                return key, txt, views, text, vision_inputs, video_inputs
-
+            # 병렬 전처리
             with ThreadPoolExecutor(max_workers=24) as executor:
                 results = list(executor.map(preprocess_message, miss_items))
 
-            # === inference-only ===
+            # 추론(공용)
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 for key, txt, views, text, vision_inputs, video_inputs in results:
-                    cache_path = self._cache_path(key, txt, views)
-                    if cache_path.exists():
-                        pooled = torch.load(cache_path, map_location="cpu", weights_only=True)
-                        pooled = pooled.pin_memory().to(device=device, non_blocking=True, dtype=torch.bfloat16)
-                        pooled_vl_tokens_dict[key] = pooled
-                        continue
+                    # 캐시 ON+경합 회피: 저장된 경우 스킵
+                    if use_cache:
+                        cache_path = self._cache_path(key, txt, views)
+                        if cache_path.exists():
+                            pooled = torch.load(cache_path, map_location="cpu")
+                            pooled = pooled.pin_memory().to(device=device, non_blocking=True, dtype=torch.bfloat16)
+                            pooled_vl_tokens_dict[key] = pooled
+                            continue
 
                     inputs = self.processor(
                         text=[text],
@@ -157,20 +169,25 @@ class QwenVLAForAction(nn.Module):
 
                     outputs = self.vl_model(**inputs, output_hidden_states=True, return_dict=True)
                     vl_tokens = outputs.hidden_states[-1]
-                    pooled = vl_tokens.mean(dim=1, keepdim=True)
+                    pooled = vl_tokens.mean(dim=1, keepdim=True)  # (1,1,Hd)
 
-                    self._atomic_save(pooled.detach().to("cpu", dtype=torch.float16), cache_path)
-                    self._enforce_cache_limit(max_gb=20)
+                    # 캐시 ON일 때만 저장/트림
+                    if use_cache:
+                        cache_path = self._cache_path(key, txt, views)
+                        self._atomic_save(pooled.detach().to("cpu", dtype=torch.float16), cache_path)
+                        self._enforce_cache_limit(max_gb=20)
+
                     pooled_vl_tokens_dict[key] = pooled.to(dtype=torch.bfloat16)
 
-        # --- 3️⃣ 순서 복원 ---
+        # 순서 복원
         pooled_vl_tokens = [pooled_vl_tokens_dict[k] for k in cache_keys if k in pooled_vl_tokens_dict]
-        vl_tokens = torch.cat(pooled_vl_tokens, dim=0)
+        vl_tokens = torch.cat(pooled_vl_tokens, dim=0)  # (B,1,Hd)
 
-        # --- 4️⃣ Action 예측 ---
+        # 액션 예측
         z_chunk = z_chunk.to(device=device, dtype=vl_tokens.dtype)
         pred_actions, delta = self.action_expert(vl_tokens, z_chunk)
         return pred_actions, delta
+
     
 class Not_freeze_QwenVLAForAction(nn.Module):
     def __init__(self,
