@@ -135,6 +135,9 @@ class RtSampler(threading.Thread):
 # ============================================================
 # 🆕 ZeroMQ Publisher Thread (수정됨 - 패딩 제거) 🆕
 # ============================================================
+# ============================================================
+# 🆕 ZeroMQ Publisher Thread (수정됨 - dummy_sock 오류 수정) 🆕
+# ============================================================
 class ZmqPublisher(threading.Thread):
     def __init__(self, sampler, clock, address, port, stop_event, rate_hz=100):
         super().__init__(daemon=True)
@@ -147,79 +150,100 @@ class ZmqPublisher(threading.Thread):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
         bind_addr = f"tcp://{self.address}:{self.port}"
-        # --- [수정됨] 소켓 옵션 추가 (메시지 쌓임 방지) ---
-        self.socket.set_hwm(10) # High Water Mark: 버퍼에 최대 10개 메시지만 유지
-        # Linger option can prevent blocking on close if messages are queued
-        self.socket.setsockopt(zmq.LINGER, 500) # Linger for 500ms on close
+        self.socket.set_hwm(10)
+        self.socket.setsockopt(zmq.LINGER, 500)
         self.socket.bind(bind_addr)
-        # --- [Numpy 버퍼 제거됨] ---
         print(f"✅ ZMQ Publisher bound to {bind_addr} at {rate_hz} Hz.")
-        print(f"   Topic: '{ZMQ_TOPIC.decode()}', Payload Size: {TOTAL_PAYLOAD_SIZE} bytes") # 수정된 크기 출력
+        print(f"   Topic: '{ZMQ_TOPIC.decode()}', Payload Size: {TOTAL_PAYLOAD_SIZE} bytes")
 
     def run(self):
         next_send_time = time.time()
-        while not self.stop_event.is_set():
-            q, p = self.sampler.get_latest_data()
+        
+        # ▼▼▼ [수정] Create poller and dummy_sock *outside* the loop ▼▼▼
+        poller = zmq.Poller()
+        dummy_sock = self.context.socket(zmq.PULL)
+        # Use unique inproc address per thread instance if needed, though usually not required
+        # dummy_addr = f"inproc://dummy_poll_{id(self)}" 
+        dummy_addr = "inproc://dummy_poll" # Usually fine
+        try:
+             dummy_sock.bind(dummy_addr)
+             poller.register(dummy_sock, zmq.POLLIN)
+        except zmq.ZMQError as e:
+            print(f"[ZmqPublisher ERR] Failed to bind dummy socket: {e}")
+            # Optionally handle this - maybe fall back to time.sleep?
+            dummy_sock = None # Indicate failure
+        # ▲▲▲ [수정] ▲▲▲
 
-            if q is not None and p is not None:
-                ts = self.clock.now() # T_create equivalent
-                force = 0.0 # Placeholder
-                send_ts = time.time() # T_send equivalent
+        try: # Added try block for better cleanup
+            while not self.stop_event.is_set():
+                q, p = self.sampler.get_latest_data()
 
-                try:
-                    # --- [수정됨] 헤더와 데이터를 한 번에 패킹 ---
-                    # q와 p는 각각 길이가 6인 리스트라고 가정
-                    payload_bytes = struct.pack(PACKET_FORMAT,
-                                                ts, send_ts, force,
-                                                *q, # list unpack
-                                                *p) # list unpack
-                    # ---
+                if q is not None and p is not None:
+                    ts = self.clock.now()
+                    force = 0.0
+                    send_ts = time.time()
 
-                    if len(payload_bytes) != TOTAL_PAYLOAD_SIZE:
-                         print(f"[ZmqPublisher ERR] Payload size mismatch! Expected {TOTAL_PAYLOAD_SIZE}, got {len(payload_bytes)}")
-                         continue
+                    try:
+                        payload_bytes = struct.pack(PACKET_FORMAT, ts, send_ts, force, *q, *p)
 
-                    # Send as a multipart message [Topic, Payload]
-                    self.socket.send_multipart([ZMQ_TOPIC, payload_bytes], zmq.DONTWAIT) # 비동기 전송 시도
+                        if len(payload_bytes) != TOTAL_PAYLOAD_SIZE:
+                            print(f"[ZmqPublisher ERR] Payload size mismatch!")
+                            continue
 
-                except zmq.Again:
-                    # HWM 도달 시 메시지 버림 (로그 출력 안함 - 성능 저하 방지)
-                    pass # Or log occasionally if needed
-                except zmq.ZMQError as e:
-                    print(f"[ZmqPublisher ERR] Failed to send ZMQ message: {e}")
-                    if e.errno == zmq.ETERM: # Context terminated
-                        break
-                except Exception as e:
-                     print(f"[ZmqPublisher ERR] Unexpected error during send: {e}")
+                        self.socket.send_multipart([ZMQ_TOPIC, payload_bytes], zmq.DONTWAIT)
 
-            # Sleep to maintain rate
-            next_send_time += self.dt
-            sleep_duration = next_send_time - time.time()
-            if sleep_duration > 0:
-                # ZMQ Poller 사용 (정확한 대기, stop_event 감지)
-                poller = zmq.Poller()
-                # Register a dummy socket for polling timeout
-                # This is a trick to make poll wait accurately without a real socket event
-                dummy_sock = self.context.socket(zmq.PULL)
-                dummy_sock.bind("inproc://dummy_poll")
-                poller.register(dummy_sock, zmq.POLLIN)
+                    except zmq.Again:
+                        pass
+                    except zmq.ZMQError as e:
+                        print(f"[ZmqPublisher ERR] Failed to send ZMQ message: {e}")
+                        if e.errno == zmq.ETERM: break
+                    except Exception as e:
+                        print(f"[ZmqPublisher ERR] Unexpected error during send: {e}")
 
-                try:
-                    # Wait for the calculated duration in milliseconds
-                    events = poller.poll(int(sleep_duration * 1000))
-                    # Check if stop event was set during sleep
-                    if self.stop_event.is_set():
-                        break
-                finally:
-                    # Clean up the dummy socket
-                    poller.unregister(dummy_sock)
-                    dummy_sock.close()
+                # Sleep to maintain rate
+                next_send_time += self.dt
+                sleep_duration = next_send_time - time.time()
+                
+                if sleep_duration > 0 and dummy_sock: # Check if dummy_sock was created
+                    try:
+                        # ▼▼▼ [수정] No need to register/unregister inside loop ▼▼▼
+                        # poller.register(dummy_sock, zmq.POLLIN) # Moved outside
+                        events = poller.poll(int(sleep_duration * 1000))
+                        # poller.unregister(dummy_sock) # Moved outside
+                        # ▲▲▲ [수정] ▲▲▲
+                        if self.stop_event.is_set(): break
+                    except zmq.ZMQError as e:
+                        # Handle potential errors during poll, e.g., context termination
+                        if e.errno == zmq.ETERM: break
+                        print(f"[ZmqPublisher WARN] Poller error: {e}")
+                        # Fallback sleep if poller fails unexpectedly
+                        time.sleep(max(0, sleep_duration))
+                    except Exception as e:
+                         print(f"[ZmqPublisher WARN] Unexpected error during poll/sleep: {e}")
+                         time.sleep(max(0, sleep_duration))
 
-        print("🧹 Cleaning up ZMQ Publisher...")
-        # Close socket and terminate context gracefully
-        self.socket.close()
-        self.context.term()
-        print("✅ ZMQ Publisher stopped.")
+                elif sleep_duration > 0: # Fallback if dummy_sock failed
+                    time.sleep(sleep_duration)
+
+
+        finally: # Ensure cleanup happens
+             print("🧹 Cleaning up ZMQ Publisher...")
+             # ▼▼▼ [수정] Clean up dummy_sock ▼▼▼
+             if dummy_sock:
+                 # Check if registered before trying to unregister
+                 try:
+                      poller.unregister(dummy_sock)
+                 except KeyError: # Already unregistered or never registered
+                      pass
+                 except Exception as e:
+                      print(f"[ZmqPublisher WARN] Error unregistering dummy_sock: {e}")
+                 dummy_sock.close()
+             # ▲▲▲ [수정] ▲▲▲
+             self.socket.close()
+             # Check if context termination is needed/safe
+             if not self.context.closed:
+                 self.context.term()
+             print("✅ ZMQ Publisher stopped.")
 
 
 # ============================================================
@@ -282,13 +306,12 @@ class RobotManager:
         self.logger.info('Activating and homing robot...')
         initializer.reset_sim_mode(self.robot)
         initializer.reset_motion_queue(self.robot, activate_home=True)
-        # initializer.reset_vacuum_module(self.robot) # Remove if no vacuum module
+        initializer.reset_vacuum_module(self.robot) # Remove if no vacuum module
         self.robot.WaitHomed()
-        self.logger.info('Robot homed.')
-        self.robot.SetCartLinVel(100) # mm/s
-        self.robot.SetJointVel(50)    # Percentage of max joint speed (e.g., 50%)
-        self.robot.SetBlending(50)   # Percentage (e.g., 50%)
-        self.robot.WaitIdle(30)      # Wait up to 30 seconds
+        self.robot.SetCartLinVel(100)
+        self.robot.SetJointVel(0.3)
+        self.robot.SetBlending(50)
+        self.robot.WaitIdle(30)
         self.logger.info('Robot setup complete.')
 
     def move_angle_points(self, points):
