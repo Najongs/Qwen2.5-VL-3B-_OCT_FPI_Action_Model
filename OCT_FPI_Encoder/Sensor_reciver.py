@@ -19,13 +19,12 @@ BUFFER_SIZE = 65535 # (UDP 최대 크기)
 # =========================
 TIMEOUT_SEC = 2.0
 MODEL_INPUT_DURATION_SEC = 1.0
-MODEL_INPUT_CHECK_INTERVAL = 0.2
+MODEL_INPUT_CHECK_INTERVAL = 1.0 # 0.2에서 1.0으로 수정
 MODEL_INPUT_NUM_SAMPLES = 650
 
 # =========================
 # 프로토콜 사이즈 (4120B)
 # =========================
-# <ddf (double ts, double send_ts, float force) = 8+8+4 = 20B
 PACKET_HEADER_FORMAT = '<ddf'
 PACKET_HEADER_SIZE = struct.calcsize(PACKET_HEADER_FORMAT)  # 20B
 ALINE_FORMAT = f'<{NXZRt}f'
@@ -35,16 +34,20 @@ TOTAL_PACKET_SIZE = PACKET_HEADER_SIZE + ALINE_SIZE         # 4120B
 # =========================
 # 공유 버퍼 / 상태
 # =========================
-continuous_sensor_data = deque(maxlen=20000)
+continuous_sensor_data = deque(maxlen=20000) # 모델 입력용 버퍼
 lock = threading.Lock()
 stop_event = threading.Event()
 
-# (수정) 전역 변수 추가
-last_corrected_total_delay = 0.0 # 모델 스레드용 보정된 지연
+last_corrected_total_delay = 0.0
 last_recv_ts = 0.0
-CLOCK_OFFSET_SECONDS = None # 계산된 시계 오차 (초 단위)
+CLOCK_OFFSET_SECONDS = None
 CALIBRATION_SAMPLES = []
-CALIBRATION_COUNT = 50 # 50개 샘플로 오차 평균 계산
+CALIBRATION_COUNT = 50
+
+# ▼▼▼ [추가] 데이터 저장을 위한 전역 변수 ▼▼▼
+save_buffer = []
+save_lock = threading.Lock()
+# ▲▲▲ [추가] ▲▲▲
 
 
 # =========================
@@ -75,7 +78,7 @@ def unpack_batch(payload_bytes: bytes, num_packets: int):
     return records
 
 # =========================
-# UDP 수신 스레드 (수정됨 - 오차 자동 보정)
+# UDP 수신 스레드 (수정됨 - 1초 요약 로그)
 # =========================
 def udp_receiver_thread():
     global last_corrected_total_delay, last_recv_ts, CLOCK_OFFSET_SECONDS
@@ -83,13 +86,18 @@ def udp_receiver_thread():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
     sock.settimeout(1.0)
-
     print(f"✅ UDP 리시버 시작 (포트 {UDP_PORT}) - [시계 오차 자동 보정 모드]")
     print(f"⏳ 최초 {CALIBRATION_COUNT}개 배치로 C++/Python 간 시계 오차를 보정합니다...")
-
     buffer = bytearray()
     expected_payload_size = 0
     pending_num_packets = 0
+
+    # ▼▼▼ 1초 요약 로그를 위한 변수 ▼▼▼
+    last_log_time = time.time()
+    batch_count_sec = 0
+    packet_count_sec = 0
+    latency_samples_sec = []
+    # ▲▲▲
 
     while not stop_event.is_set():
         try:
@@ -97,6 +105,8 @@ def udp_receiver_thread():
         except socket.timeout:
             continue
         except Exception as e:
+            if stop_event.is_set():
+                break
             print(f"[UDP] 수신 오류: {e}")
             continue
 
@@ -118,19 +128,28 @@ def udp_receiver_thread():
                 continue
 
             last_ts, last_send_ts = 0.0, 0.0
+            
+            dict_records = []
+            for ts, send_ts, force, aline in records:
+                last_ts, last_send_ts = ts, send_ts
+                dict_records.append({
+                    "timestamp": ts,
+                    "send_timestamp": send_ts,
+                    "force": force,
+                    "aline": aline
+                })
+
             with lock:
-                for ts, send_ts, force, aline in records:
-                    last_ts, last_send_ts = ts, send_ts
-                    continuous_sensor_data.append({
-                        "timestamp": ts, "force": force, "aline": aline,
-                    })
+                continuous_sensor_data.extend(dict_records)
+            with save_lock:
+                save_buffer.extend(dict_records)
+            
             last_recv_ts = recv_time
 
-            # --- [핵심 수정: 시계 오차 보정 로직] ---
+            # --- [시계 오차 보정 로직] ---
             queue_delay_cpp_ms = (last_send_ts - last_ts) * 1000
             net_plus_offset_s = recv_time - last_send_ts
 
-            # 1. 보정 단계 (CLOCK_OFFSET_SECONDS가 아직 계산 안됐을 때)
             if CLOCK_OFFSET_SECONDS is None:
                 CALIBRATION_SAMPLES.append(net_plus_offset_s)
                 if len(CALIBRATION_SAMPLES) >= CALIBRATION_COUNT:
@@ -141,31 +160,84 @@ def udp_receiver_thread():
                     print("="*80 + "\n")
                 else:
                      print(f"⏳ 보정 중... ({len(CALIBRATION_SAMPLES)}/{CALIBRATION_COUNT})", end='\r')
-
-            # 2. 보정 후 실제 지연 계산 및 출력
             else:
-                # (Net+오차)에서 계산된 오차를 빼서 '실제 Net 지연'을 구함
                 net_delay_ms = (net_plus_offset_s - CLOCK_OFFSET_SECONDS) * 1000
-                
-                # '실제 총 지연' = (C++ 큐 지연) + (실제 Net 지연)
                 corrected_total_delay_ms = queue_delay_cpp_ms + net_delay_ms
-                
-                # 모델 스레드와 공유할 값 업데이트
                 last_corrected_total_delay = corrected_total_delay_ms / 1000.0
 
-                print(f"📦 배치({pending_num_packets}개) | "
-                      f"⚡️실제 총지연:{corrected_total_delay_ms: >6.1f}ms = "
-                      f"[C++큐:{queue_delay_cpp_ms: >6.1f}ms] + "
-                      f"[Net:{net_delay_ms: >6.1f}ms] | "
-                      f"버퍼:{len(continuous_sensor_data)}")
-            # --- [핵심 수정 끝] ---
+                # 1초간 데이터 수집
+                batch_count_sec += 1
+                packet_count_sec += pending_num_packets
+                latency_samples_sec.append(corrected_total_delay_ms)
 
             buffer.clear()
             pending_num_packets = 0
             expected_payload_size = 0
+        
+        # ▼▼▼ [수정] 1초마다 요약 로그 출력 ▼▼▼
+        current_time = time.time()
+        if CLOCK_OFFSET_SECONDS is not None and (current_time - last_log_time >= 1.0): # 5.0 -> 1.0
+            if batch_count_sec > 0:
+                avg_latency = np.mean(latency_samples_sec)
+                # "5초간" -> "1초간"
+                print(f"📡 1초간 수신: {batch_count_sec}개 배치 ({packet_count_sec}개 패킷) | "
+                      f"평균 총지연: {avg_latency:.1f}ms | "
+                      f"버퍼: {len(continuous_sensor_data)}")
+                
+                # 카운터 초기화
+                latency_samples_sec.clear()
+                batch_count_sec = 0
+                packet_count_sec = 0
+            
+            last_log_time = current_time
+        # ▲▲▲ [수정] ▲▲▲
 
     sock.close()
     print("UDP 수신 스레드 종료.")
+
+# ▼▼▼ [수정] 데이터 저장을 위한 함수 (파일명에 타임스탬프 포함) ▼▼▼
+def save_data_to_npz():
+    """
+    프로그램 종료 시 save_buffer에 누적된 데이터를 .npz 파일로 저장합니다.
+    파일명은 첫 번째 데이터의 타임스탬프를 포함합니다.
+    """
+    
+    filename = "saved_data_empty.npz" # 기본 파일명 (데이터가 없는 경우)
+    
+    with save_lock:
+        if not save_buffer:
+            print("저장할 데이터가 없습니다.")
+            return
+
+        try:
+            # 1. 첫 번째 타임스탬프를 가져와 파일명 생성
+            first_ts_int = int(save_buffer[0]['timestamp'])
+            filename = f"saved_data_{first_ts_int}.npz"
+            
+            print(f"\n💾 저장 중... {len(save_buffer)}개의 레코드를 {filename}에 저장합니다...")
+
+            # 2. 리스트 딕셔너리를 Numpy 배열로 변환
+            timestamps = np.array([d['timestamp'] for d in save_buffer], dtype=np.float64)
+            send_timestamps = np.array([d['send_timestamp'] for d in save_buffer], dtype=np.float64)
+            forces = np.array([d['force'] for d in save_buffer], dtype=np.float32)
+            alines = np.array([d['aline'] for d in save_buffer], dtype=np.float32)
+            
+            # 3. 압축하여 .npz 파일로 저장
+            np.savez(filename, 
+                    timestamps=timestamps,
+                    send_timestamps=send_timestamps,
+                    forces=forces,
+                    alines=alines)
+            
+            print(f"✅ 저장 완료! ({filename})")
+            print(f"  - timestamps: {timestamps.shape}")
+            print(f"  - send_timestamps: {send_timestamps.shape}")
+            print(f"  - forces: {forces.shape}")
+            print(f"  - alines: {alines.shape}")
+
+        except Exception as e:
+            print(f"[ERROR] 파일 저장 실패 ({filename}): {e}")
+# ▲▲▲ [수정] ▲▲▲
 
 
 # =========================
@@ -208,8 +280,6 @@ def model_input_generator_thread():
         print(f"\n✅ 모델 입력 생성 성공")
         print(f"  ⏱ 구간: {t_start:.3f} ~ {t_end:.3f} | 길이 1.0s")
         print(f"  Force shape: {force_data.shape}, M-mode shape: {mmode_image_data.shape}")
-        
-        # (수정) 보정된 총 지연 값을 사용
         print(f"  📶 실제 총 지연: {last_corrected_total_delay*1000:.1f} ms | ⚙️ Processing: {processing_delay:.3f}s | "
               f"🕒 Pipeline: {pipeline_delay:.3f}s")
 
@@ -229,7 +299,13 @@ if __name__ == "__main__":
     udp_thread.start()
     model_thread.start()
 
-    udp_thread.join()
-    stop_event.set()
-    print("✅ 메인 프로그램 종료.")
-
+    try:
+        udp_thread.join()
+    finally:
+        stop_event.set() 
+        
+        # ▼▼▼ [수정] 파일명 인자 없이 저장 함수 호출 ▼▼▼
+        save_data_to_npz()
+        # ▲▲▲ [수정] ▲▲▲
+        
+        print("✅ 메인 프로그램 종료.")
