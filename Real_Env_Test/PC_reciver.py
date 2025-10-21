@@ -193,16 +193,10 @@ try:
                 try: meta = json.loads(meta_raw.decode("utf-8"))
                 except Exception as e: print(f"[WARN] Cam meta decode error: {e}"); continue
 
-        cam = meta.get("camera", "unknown")
-        ts = float(meta.get("timestamp", 0.0))
-        send_time = float(meta.get("send_time", 0.0))
-        recv_time = time.time()
-
-        # ✨✨✨ 핵심 수정 부분: 핸드셰이크 패킷 (ts=0.0) 건너뛰기 ✨✨✨
-        if ts == 0.0:
-             print(f"⚪️ Received non-data message (ts=0.0) from {cam}, skipping.")
-             continue # 다음 메시지 수신으로 넘어감
-        # ✨✨✨ 수정 완료 ✨✨✨
+                cam = meta.get("camera", "unknown")
+                ts = float(meta.get("timestamp", 0.0))
+                send_time = float(meta.get("send_time", 0.0))
+                # recv_time = now_wall # 일관성을 위해 외부 시간 사용
 
                 net_delay = (now_wall - send_time) if send_time > 0 else 0.0
                 total_delay = (now_wall - ts) if ts > 0 else 0.0
@@ -341,13 +335,12 @@ try:
         # ==========================
         # 로봇 데이터 주기적 저장 (예: 1000개 모이면 저장)
         # ==========================
-        if now - last_fps_print >= FPS_PERIOD:
-            elapsed = now - last_fps_print
-            if elapsed > 0: # Prevent division by zero if loop runs extremely fast
-                line = " | ".join([f"{k}:{cnt[k]/elapsed:.1f}fps" for k in sorted(cnt)])
-                print("📊 평균:", line)
-            cnt = defaultdict(int)
-            last_fps_print = now
+        if len(robot_data_buffer) >= 1000:
+             data_to_save = list(robot_data_buffer)
+             robot_data_buffer.clear()
+             # 저장 함수를 별도 스레드로 돌릴 수도 있음 (지금은 동기식)
+             save_robot_data_to_csv(data_to_save, ROBOT_CSV_PATH)
+
 
 except KeyboardInterrupt:
     print("\n🛑 Interrupted by user.")
