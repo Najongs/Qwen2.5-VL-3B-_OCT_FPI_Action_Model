@@ -4,7 +4,7 @@ import depthai as dai
 import pyzed.sl as sl
 
 # ===================== 설정 =====================
-SERVER_IP = "10.130.4.79"
+SERVER_IP = "10.130.42.86"
 SERVER_PORT = 5555
 JPEG_QUALITY = 85
 OUTPUT_DIR = "./dataset/ZED_Captures"
