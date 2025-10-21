@@ -7,6 +7,10 @@ checkpoints*/
 cache/
 dataset/
 
+recv_all*/
+
+*.npz
+
 # C extensions
 *.so
 

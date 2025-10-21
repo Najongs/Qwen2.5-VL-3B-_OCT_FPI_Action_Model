@@ -163,6 +163,12 @@ try:
         send_time = float(meta.get("send_time", 0.0))
         recv_time = time.time()
 
+        # ✨✨✨ 핵심 수정 부분: 핸드셰이크 패킷 (ts=0.0) 건너뛰기 ✨✨✨
+        if ts == 0.0:
+             print(f"⚪️ Received non-data message (ts=0.0) from {cam}, skipping.")
+             continue # 다음 메시지 수신으로 넘어감
+        # ✨✨✨ 수정 완료 ✨✨✨
+
         net_delay = (recv_time - send_time) if send_time > 0 else 0.0
         total_delay = (recv_time - ts) if ts > 0 else 0.0
 
@@ -234,8 +240,9 @@ try:
         # ==========================
         if now - last_fps_print >= FPS_PERIOD:
             elapsed = now - last_fps_print
-            line = " | ".join([f"{k}:{cnt[k]/elapsed:.1f}fps" for k in sorted(cnt)])
-            print("📊 평균:", line)
+            if elapsed > 0: # Prevent division by zero if loop runs extremely fast
+                line = " | ".join([f"{k}:{cnt[k]/elapsed:.1f}fps" for k in sorted(cnt)])
+                print("📊 평균:", line)
             cnt = defaultdict(int)
             last_fps_print = now
 
