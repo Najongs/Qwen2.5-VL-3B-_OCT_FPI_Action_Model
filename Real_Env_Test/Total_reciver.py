@@ -222,8 +222,11 @@ signal.signal(signal.SIGINT, handle_sigint) # 시그널 핸들러 설정
 # ==============================
 # 7️⃣ UDP 센서 수신 스레드
 # ==============================
+# ▼▼▼ [수정된 섹션] ▼▼▼
+# (데이터 누락(손실) 버그가 수정된 버전입니다)
 def sensor_udp_receiver_thread():
-    global sensor_clock_offset_s, sensor_latest_status, sensor_save_buffer
+    # SENSOR_RECEIVED_FIRST를 함수 내에서 수정하므로 global 선언
+    global sensor_clock_offset_s, sensor_latest_status, sensor_save_buffer, SENSOR_RECEIVED_FIRST
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -251,42 +254,79 @@ def sensor_udp_receiver_thread():
             if stop_event.is_set(): break
             print(f"[UDP Sensor] Receive error: {e}"); continue
 
+        # ▼▼▼ [수정됨] 데이터 누락 방지 로직 ▼▼▼
+        
+        # 1. 4바이트 헤더(패킷 개수) 수신 시
         if len(data) == 4:
             try:
+                # 만약 이전에 처리 못한 페이로드가 버퍼에 남아있다면,
+                # (즉, 헤더가 연속 두 번 들어온 이례적인 상황)
+                # 기존 버퍼는 비우고 새로 시작
+                if expected_payload_size > 0 or pending_num_packets > 0:
+                    print(f"[WARN] Sensor UDP: New header received. Clearing previous buffer ({len(buffer)}B).")
+                    buffer.clear()
+                    
                 pending_num_packets = struct.unpack('<I', data)[0]
-                expected_payload_size = pending_num_packets * SENSOR_TOTAL_PACKET_SIZE
-                buffer.clear()
+                if pending_num_packets > 0:
+                    expected_payload_size = pending_num_packets * SENSOR_TOTAL_PACKET_SIZE
+                else:
+                    # 0개짜리 헤더가 오면 무시
+                    pending_num_packets = 0; expected_payload_size = 0
+                    
             except struct.error:
                 print("[WARN] Invalid UDP header received."); pending_num_packets = 0; expected_payload_size = 0
-            continue
+            
+            # 중요: 'continue'를 하지 않고, 바로 아래의 버퍼 체크 로직으로 넘어감
+            # (페이로드가 헤더보다 먼저 도착해서 이미 버퍼에 차 있을 수 있음)
 
-        if expected_payload_size > 0:
+        # 2. 4바이트보다 큰 페이로드 데이터 수신 시
+        elif len(data) > 4:
+            # 페이로드가 헤더보다 먼저 도착한 경우, 버퍼에 쌓음
             buffer.extend(data)
-            if len(buffer) >= expected_payload_size:
-                recv_time = time.time()
-                payload_to_process = buffer[:expected_payload_size]
-                num_packets_in_batch = pending_num_packets
-                buffer = buffer[expected_payload_size:]; pending_num_packets = 0; expected_payload_size = 0
+        
+        # 3. 헤더/페이로드 수신과 관계없이 *항상* 버퍼 상태 체크
+        # (expected_payload_size가 0보다 커야 함 = 헤더를 1번 이상 받음)
+        if expected_payload_size > 0 and len(buffer) >= expected_payload_size:
+            
+            recv_time = time.time()
+            
+            # [수정] 정확히 예상 크기만큼만 잘라서 처리
+            payload_to_process = buffer[:expected_payload_size]
+            # [수정] 처리한 부분은 버퍼에서 제거 (초과분은 남김)
+            buffer = buffer[expected_payload_size:]
+            
+            # [수정] 처리할 패킷 수를 별도 변수에 저장
+            num_packets_in_batch = pending_num_packets
+            
+            # [수정] 상태 변수 즉시 초기화 (다음 헤더 수신 대비)
+            pending_num_packets = 0; expected_payload_size = 0
 
-                try:
-                    records = []
-                    mv = memoryview(payload_to_process)
-                    offset = 0
-                    last_ts_in_batch, last_send_ts_in_batch = 0.0, 0.0
-                    for _ in range(num_packets_in_batch):
-                        header = mv[offset:offset + SENSOR_PACKET_HEADER_SIZE]
-                        ts, send_ts, force = struct.unpack(SENSOR_PACKET_HEADER_FORMAT, header); offset += SENSOR_PACKET_HEADER_SIZE
-                        aline_bytes = mv[offset:offset + SENSOR_ALINE_SIZE]
-                        aline = np.frombuffer(aline_bytes, dtype=np.float32).copy(); offset += SENSOR_ALINE_SIZE
-                        records.append({"timestamp": ts, "send_timestamp": send_ts, "force": float(force), "aline": aline})
-                        last_ts_in_batch, last_send_ts_in_batch = ts, send_ts
-                except Exception as e: print(f"[ERROR] Sensor UDP unpack failed: {e}"); continue
+            try:
+                records = []
+                mv = memoryview(payload_to_process)
+                offset = 0
+                last_ts_in_batch, last_send_ts_in_batch = 0.0, 0.0
+                # [수정] 저장해둔 num_packets_in_batch 사용
+                for _ in range(num_packets_in_batch): 
+                    header = mv[offset:offset + SENSOR_PACKET_HEADER_SIZE]
+                    ts, send_ts, force = struct.unpack(SENSOR_PACKET_HEADER_FORMAT, header); offset += SENSOR_PACKET_HEADER_SIZE
+                    aline_bytes = mv[offset:offset + SENSOR_ALINE_SIZE]
+                    aline = np.frombuffer(aline_bytes, dtype=np.float32).copy(); offset += SENSOR_ALINE_SIZE
+                    records.append({"timestamp": ts, "send_timestamp": send_ts, "force": float(force), "aline": aline})
+                    last_ts_in_batch, last_send_ts_in_batch = ts, send_ts
+            except Exception as e: 
+                print(f"[ERROR] Sensor UDP unpack failed: {e}")
+                # 파싱 실패 시(데이터 손상 등) 버퍼를 아예 비워 동기화 재시도
+                buffer.clear() 
+                continue
 
-                # ⚠️ START_SAVE_FLAG가 설정되었을 때만 버퍼에 추가합니다.
-                if START_SAVE_FLAG.is_set():
-                    with sensor_save_lock: sensor_save_buffer.extend(records)
-                
-                # --- 클럭 오프셋 보정 및 지연 시간 계산 로직 ---
+            # ⚠️ START_SAVE_FLAG가 설정되었을 때만 버퍼에 추가합니다.
+            if START_SAVE_FLAG.is_set():
+                with sensor_save_lock: sensor_save_buffer.extend(records)
+            
+            # --- 클럭 오프셋 보정 및 지연 시간 계산 로직 ---
+            # (last_send_ts_in_batch가 0인 경우(패킷 0개) 방지)
+            if num_packets_in_batch > 0:
                 net_plus_offset_s = recv_time - last_send_ts_in_batch
                 if sensor_clock_offset_s is None:
                     sensor_calibration_samples.append(net_plus_offset_s)
@@ -295,12 +335,9 @@ def sensor_udp_receiver_thread():
                         print("\n" + "="*80 + f"\n✅ Sensor Clock Offset Calibrated: {sensor_clock_offset_s * 1000:.1f} ms\n" + "="*80 + "\n")
                         
                         # 1. 🚨 센서 최초 수신 (보정 완료) 확인 🚨
-                        # (전역 변수임을 가정하고 global 키워드를 사용합니다.)
-                        global SENSOR_RECEIVED_FIRST
                         if not SENSOR_RECEIVED_FIRST:
                             SENSOR_RECEIVED_FIRST = True
                             print("🔬 Sensor: Calibration complete. Checking readiness...")
-                            # 이 함수는 ROBOT, SENSOR, CAM 플래그를 모두 확인하고 START_SAVE_FLAG를 설정합니다.
                             check_all_ready()
                             
                     else: print(f"⏳ Sensor Calibrating... ({len(sensor_calibration_samples)}/{SENSOR_CALIBRATION_COUNT})", end='\r')
@@ -309,6 +346,8 @@ def sensor_udp_receiver_thread():
                     net_delay_ms = (net_plus_offset_s - sensor_clock_offset_s) * 1000
                     corrected_total_delay_ms = queue_delay_cpp_ms + net_delay_ms
                     batch_count_sec += 1; packet_count_sec += num_packets_in_batch; latency_samples_sec.append(corrected_total_delay_ms)
+        
+        # ▲▲▲ [수정된 로직 끝] ▲▲▲
 
         # --- 1초마다 로깅 및 상태 업데이트 ---
         current_time = time.time()
@@ -319,20 +358,23 @@ def sensor_udp_receiver_thread():
                 with sensor_save_lock: current_buffer_size = len(sensor_save_buffer)
                 current_status = {
                     "avg_latency": avg_lat, "batch_count": batch_count_sec, "packet_count": packet_count_sec,
-                    "buffer_size": current_buffer_size, "last_recv_wall": current_time if batch_count_sec > 0 else sensor_latest_status["last_recv_wall"] # 데이터 수신 시에만 갱신
+                    "buffer_size": current_buffer_size,
+                    "last_recv_wall": current_time if batch_count_sec > 0 else sensor_latest_status.get("last_recv_wall", 0.0) # 데이터 수신 시에만 갱신
                 }
                 latency_samples_sec.clear(); batch_count_sec = 0; packet_count_sec = 0
             else: # 보정 중일 때
-                 current_status = sensor_latest_status # 이전 상태 유지
-                 current_status["last_recv_wall"] = current_time # 마지막 확인 시간 갱신 (Stall 감지용)
+                 current_status = sensor_latest_status.copy() # 이전 상태 복사
+                 # Stall 감지용으로 last_recv_wall을 현재 시간으로 갱신
+                 # (실제 데이터 수신 여부와 관계없이 스레드가 돌고 있음을 의미)
+                 current_status["last_recv_wall"] = current_time
 
             # 전역 변수 업데이트 (메인 스레드에서 읽기 위함)
-            # 파이썬 dict 업데이트는 원자적이므로 별도 락 불필요
             sensor_latest_status = current_status
             last_log_time = current_time
 
     sock.close()
     print("🛑 Sensor UDP Receiver thread stopped.")
+# ▲▲▲ [수정된 섹션] ▲▲▲
 
 # ==============================
 # 8️⃣ 메인 수신 루프 (통합됨)
@@ -413,11 +455,9 @@ try:
                         joints, pose = unpacked_data[3:9], unpacked_data[9:15]
                         
                         # 1. 🚨 로봇 최초 수신 확인 🚨
-                        # (전역 변수임을 가정하고 global 키워드는 생략합니다. 실제 코드에서는 필요할 수 있습니다.)
                         if not ROBOT_RECEIVED_FIRST:
                             ROBOT_RECEIVED_FIRST = True
                             print("🤖 Robot: First data received. Checking readiness...")
-                            # 이 함수는 ROBOT, SENSOR, CAM 플래그를 모두 확인하고 START_SAVE_FLAG를 설정합니다.
                             check_all_ready() 
                         
                         robot_cnt += 1
@@ -444,8 +484,10 @@ try:
             else: print("  Waiting for robot data...")
 
             print("🔬 Sensor (UDP):")
-            s_status = sensor_latest_status
-            s_avg_lat = s_status['avg_latency']; s_buffer = s_status['buffer_size']; s_last_recv = s_status['last_recv_wall']
+            s_status = sensor_latest_status # 락 없이 최신 상태 읽기 (원자적)
+            s_avg_lat = s_status.get('avg_latency', 0.0)
+            s_buffer = s_status.get('buffer_size', 0)
+            s_last_recv = s_status.get('last_recv_wall', 0.0)
             s_stall_mark = " ⛔STALLED" if (now_wall - s_last_recv) >= STALL_SEC else ""
             if sensor_clock_offset_s is not None:
                  print(f"  {'Sensor State':<25} | Last Recv: {datetime.fromtimestamp(s_last_recv).strftime('%H:%M:%S')} | Avg Lat: {s_avg_lat:6.1f}ms | SaveBuf: {s_buffer:<6d}{s_stall_mark}")
@@ -473,7 +515,7 @@ finally:
 
     # 스레드 종료 대기 (UDP 먼저)
     print("⏳ Waiting for Sensor UDP thread to finish...")
-    if sensor_thread.is_alive():
+    if 'sensor_thread' in locals() and sensor_thread.is_alive():
         sensor_thread.join(timeout=5.0)
         if sensor_thread.is_alive(): print("[WARN] Sensor UDP thread did not exit cleanly.")
         else: print("✅ Sensor UDP thread finished.")
@@ -495,7 +537,8 @@ finally:
     else: print("  No robot data received.")
     print("\n🔬 Final Sensor Status:")
     s_status = sensor_latest_status
-    print(f"  Avg Latency: {s_status['avg_latency']:.1f}ms | Buffer Size: {s_status['buffer_size']} | Last Recv: {datetime.fromtimestamp(s_status['last_recv_wall']).strftime('%Y-%m-%d %H:%M:%S') if s_status['last_recv_wall'] > 0 else 'N/A'}")
+    # print(f"  Avg Latency: {s_status.get('avg_latency', 0.0):.1f}ms | Buffer Size: {s_status.get('buffer_size', 0)} | Last Recv: {datetime.fromtimestamp(s_status.get('last_recv_wall', 0.0)).strftime('%Y-%m-%d %H:%M:%S') if s_status.get('last_recv_wall', 0.0) > 0 else 'N/A'}")
+    print(f"  Avg Latency: {s_status.get('avg_latency', 0.0):.1f}ms | Buffer Size: {s_status.get('buffer_size', 0)} | Last Recv: {s_status.get('last_recv_wall', 0.0) if s_status.get('last_recv_wall', 0.0) > 0 else 'N/A'}")
 
     # 이미지 저장 스레드 종료 대기
     writer.stop()

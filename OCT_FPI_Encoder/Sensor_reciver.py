@@ -29,7 +29,13 @@ PACKET_HEADER_FORMAT = '<ddf'
 PACKET_HEADER_SIZE = struct.calcsize(PACKET_HEADER_FORMAT)  # 20B
 ALINE_FORMAT = f'<{NXZRt}f'
 ALINE_SIZE = struct.calcsize(ALINE_FORMAT)                  # 4100B
-TOTAL_PACKET_SIZE = PACKET_HEADER_SIZE + ALINE_SIZE         # 4120B
+
+TOTAL_PACKET_SIZE = 8 + 8 + 4 + (4 * NXZRt)
+PACKET_FORMAT = f'<d d f {NXZRt}f'
+
+# 상수가 올바른지 Python 자체적으로 검증
+assert struct.calcsize(PACKET_FORMAT) == TOTAL_PACKET_SIZE, \
+    f"Struct 크기 불일치! C++: {TOTAL_PACKET_SIZE}, Python: {struct.calcsize(PACKET_FORMAT)}"
 
 # =========================
 # 공유 버퍼 / 상태
@@ -62,21 +68,47 @@ signal.signal(signal.SIGINT, handle_sigint)
 # =========================
 # 데이터 언팩 (4120B)
 # =========================
-def unpack_batch(payload_bytes: bytes, num_packets: int):
+def unpack_batch(buffer_data, num_packets):
+    """
+    C++ DataPacket (4120 바이트) * num_packets 개수만큼의
+    버퍼 데이터를 파싱하여 레코드 리스트로 반환합니다.
+    """
     records = []
-    mv = memoryview(payload_bytes)
-    offset = 0
-    for _ in range(num_packets):
-        header = mv[offset:offset + PACKET_HEADER_SIZE]
-        ts, send_ts, force = struct.unpack(PACKET_HEADER_FORMAT, header)
-        offset += PACKET_HEADER_SIZE
+    
+    # 예상 버퍼 크기와 실제 버퍼 크기가 일치하는지 확인
+    expected_size = num_packets * TOTAL_PACKET_SIZE
+    if len(buffer_data) != expected_size:
+        print(f"[ERROR] unpack_batch: 크기 불일치! "
+              f"예상: {expected_size}B, 실제: {len(buffer_data)}B")
+        # 크기가 안 맞으면 데이터가 깨지므로 빈 리스트 반환
+        return [] 
 
-        aline_bytes = mv[offset:offset + ALINE_SIZE]
-        aline = np.frombuffer(aline_bytes, dtype=np.float32).copy()
-        offset += ALINE_SIZE
-        records.append((ts, send_ts, float(force), aline))
+    try:
+        # iter_unpack을 사용하여 버퍼를 4120 바이트 단위로 순회
+        for unpacked_data in struct.iter_unpack(PACKET_FORMAT, buffer_data):
+            # unpacked_data[0]: ts (double)
+            # unpacked_data[1]: send_ts (double)
+            # unpacked_data[2]: force (float)
+            # unpacked_data[3:]: aline_data (float * 1025 튜플)
+            
+            records.append({
+                "timestamp": unpacked_data[0],
+                "send_timestamp": unpacked_data[1],
+                "force": unpacked_data[2],
+                # 튜플(unpacked_data[3:])을 리스트로 변환 (필요시)
+                "aline": list(unpacked_data[3:]) 
+            })
+            
+    except struct.error as e:
+        print(f"[ERROR] struct.iter_unpack 실패: {e}. 포맷/데이터 손상 확인 필요.")
+        # 에러 발생 시 빈 리스트 반환
+        return []
+
+    # 헤더에 명시된 패킷 수와 실제 파싱된 수가 다르면 경고
+    if len(records) != num_packets:
+        print(f"[WARNING] 패킷 수 불일치! 헤더: {num_packets}개, 실제 파싱: {len(records)}개")
+
     return records
-
 # =========================
 # UDP 수신 스레드 (수정됨 - 1초 요약 로그)
 # =========================
@@ -88,16 +120,16 @@ def udp_receiver_thread():
     sock.settimeout(1.0)
     print(f"✅ UDP 리시버 시작 (포트 {UDP_PORT}) - [시계 오차 자동 보정 모드]")
     print(f"⏳ 최초 {CALIBRATION_COUNT}개 배치로 C++/Python 간 시계 오차를 보정합니다...")
+    
     buffer = bytearray()
     expected_payload_size = 0
     pending_num_packets = 0
 
-    # ▼▼▼ 1초 요약 로그를 위한 변수 ▼▼▼
+    # 1초 요약 로그 변수
     last_log_time = time.time()
     batch_count_sec = 0
     packet_count_sec = 0
     latency_samples_sec = []
-    # ▲▲▲
 
     while not stop_event.is_set():
         try:
@@ -110,39 +142,86 @@ def udp_receiver_thread():
             print(f"[UDP] 수신 오류: {e}")
             continue
 
+        # ▼▼▼ [수정] 헤더/페이로드 순서 꼬임 방지 로직 ▼▼▼
+        
+        # 1. 4바이트 헤더(패킷 개수) 수신 시
         if len(data) == 4:
-            pending_num_packets = struct.unpack('<I', data)[0]
-            expected_payload_size = pending_num_packets * TOTAL_PACKET_SIZE
-            buffer.clear()
-            continue
+            # 만약 이전에 처리 못한 페이로드가 버퍼에 남아있다면,
+            # (즉, 헤더가 연속 두 번 들어온 이례적인 상황)
+            # 기존 버퍼는 비우고 새로 시작
+            if expected_payload_size > 0 or pending_num_packets > 0:
+                 print(f"[WARNING] 새 헤더 수신. 이전 버퍼( {len(buffer)}B )를 비웁니다.")
+                 buffer.clear()
 
-        buffer.extend(data)
-        if len(buffer) >= expected_payload_size > 0:
+            pending_num_packets = struct.unpack('<I', data)[0]
+            if pending_num_packets > 0:
+                expected_payload_size = pending_num_packets * TOTAL_PACKET_SIZE
+            else:
+                # 0개짜리 헤더가 오면 무시
+                expected_payload_size = 0
+                pending_num_packets = 0
+            
+            # 중요: 헤더 수신 시 buffer.clear()를 하지 않음
+            # (헤더보다 페이로드가 먼저 도착한 경우를 대비)
+            
+            # print(f"헤더 수신: {pending_num_packets}개, {expected_payload_size}B 대기") # (디버그용)
+            
+            # 다음 루프로 가서 페이로드 수신 대기
+            # (단, 이미 버퍼에 데이터가 차있을 수 있으므로 continue 안 함)
+            pass
+
+        # 2. 페이로드 데이터 수신 시
+        elif len(data) > 4:
+             buffer.extend(data)
+             # print(f"페이로드 수신: {len(data)}B / 누적 {len(buffer)}B") # (디버그용)
+        
+        # 3. 헤더/페이로드 무관하게 버퍼 체크
+        # (expected_payload_size가 0보다 커야 함 = 헤더를 1번 이상 받음)
+        if expected_payload_size > 0 and len(buffer) >= expected_payload_size:
+            
+            # (디버그용) 정확히 맞지 않으면 경고
+            if len(buffer) > expected_payload_size:
+                 print(f"[WARNING] 버퍼가 예상보다 큼! {len(buffer)}B > {expected_payload_size}B. "
+                       f"초과분 {len(buffer) - expected_payload_size}B 남김.")
+
             recv_time = time.time() # T_recv
             
+            # 정확히 예상 크기만큼만 잘라서 처리
+            payload_to_process = buffer[:expected_payload_size]
+            # 처리한 부분은 버퍼에서 제거
+            buffer = buffer[expected_payload_size:]
+            
             try:
-                records = unpack_batch(buffer[:expected_payload_size], pending_num_packets)
+                # ▼▼▼ [수정] 새 unpack_batch 함수 호출 ▼▼▼
+                records = unpack_batch(payload_to_process, pending_num_packets)
             except Exception as e:
                 print(f"[ERROR] 언팩 실패: {e}")
+                # 상태 초기화
                 buffer.clear()
+                pending_num_packets = 0
+                expected_payload_size = 0
                 continue
-
-            last_ts, last_send_ts = 0.0, 0.0
             
-            dict_records = []
-            for ts, send_ts, force, aline in records:
-                last_ts, last_send_ts = ts, send_ts
-                dict_records.append({
-                    "timestamp": ts,
-                    "send_timestamp": send_ts,
-                    "force": force,
-                    "aline": aline
-                })
+            # 언팩 실패 시(데이터 손상) records가 비어있을 수 있음
+            if not records:
+                 print("[ERROR] 언팩 결과 데이터가 없습니다. 이 배치를 건너뜁니다.")
+                 # 상태 초기화
+                 pending_num_packets = 0
+                 expected_payload_size = 0
+                 continue
+                 
+            # ▲▲▲ [수정] ▲▲▲
 
+            # (이하 로직은 기존과 동일)
+            
+            # 마지막 패킷의 타임스탬프 (오차 계산용)
+            last_ts = records[-1]["timestamp"]
+            last_send_ts = records[-1]["send_timestamp"]
+            
             with lock:
-                continuous_sensor_data.extend(dict_records)
+                continuous_sensor_data.extend(records)
             with save_lock:
-                save_buffer.extend(dict_records)
+                save_buffer.extend(records)
             
             last_recv_ts = recv_time
 
@@ -170,16 +249,16 @@ def udp_receiver_thread():
                 packet_count_sec += pending_num_packets
                 latency_samples_sec.append(corrected_total_delay_ms)
 
-            buffer.clear()
+            # 버퍼 처리가 끝났으므로 상태 초기화
+            # (주의: buffer.clear()가 아님! 위에서 이미 잘라냈음)
             pending_num_packets = 0
             expected_payload_size = 0
         
-        # ▼▼▼ [수정] 1초마다 요약 로그 출력 ▼▼▼
+        # [1초마다 요약 로그 출력]
         current_time = time.time()
-        if CLOCK_OFFSET_SECONDS is not None and (current_time - last_log_time >= 1.0): # 5.0 -> 1.0
+        if CLOCK_OFFSET_SECONDS is not None and (current_time - last_log_time >= 1.0):
             if batch_count_sec > 0:
                 avg_latency = np.mean(latency_samples_sec)
-                # "5초간" -> "1초간"
                 print(f"📡 1초간 수신: {batch_count_sec}개 배치 ({packet_count_sec}개 패킷) | "
                       f"평균 총지연: {avg_latency:.1f}ms | "
                       f"버퍼: {len(continuous_sensor_data)}")
@@ -190,7 +269,6 @@ def udp_receiver_thread():
                 packet_count_sec = 0
             
             last_log_time = current_time
-        # ▲▲▲ [수정] ▲▲▲
 
     sock.close()
     print("UDP 수신 스레드 종료.")
