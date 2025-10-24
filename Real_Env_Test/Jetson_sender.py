@@ -12,7 +12,7 @@ SERVER_PORT = 5555
 JPEG_QUALITY = 85
 
 OUTPUT_DIR = "./dataset/ZED_Captures"
-SEND_ZED_RIGHT = True
+SEND_ZED_RIGHT = False
 CAPTURE_INTERVAL = 1 # ✅ 1초마다 트리거
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -203,7 +203,7 @@ def run_oak(camera_socket="RGB", sender=None, trigger=None):
     cam.setFps(60)
     cam.setInterleaved(False)
     cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-    cam.initialControl.setManualFocus(110)
+    cam.initialControl.setManualFocus(105)
 
     xout = pipeline.createXLinkOut()
     xout.setStreamName("video")

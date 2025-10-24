@@ -304,12 +304,13 @@ class RobotManager:
 
     def setup(self):
         self.logger.info('Activating and homing robot...')
+        self.robot.SetJointVel(3)
         initializer.reset_sim_mode(self.robot)
         initializer.reset_motion_queue(self.robot, activate_home=True)
         initializer.reset_vacuum_module(self.robot) # Remove if no vacuum module
         self.robot.WaitHomed()
         self.robot.SetCartLinVel(100)
-        self.robot.SetJointVel(0.3)
+        self.robot.SetJointVel(1)
         self.robot.SetBlending(50)
         self.robot.WaitIdle(30)
         self.logger.info('Robot setup complete.')
@@ -321,7 +322,7 @@ class RobotManager:
         for idx, angles in enumerate(points):
             self.logger.info(f'Moving to joint angles {idx+1}: {angles}')
             self.robot.MoveJoints(*angles)
-            self.robot.WaitIdle(60) # Wait up to 60 seconds for move to complete
+            self.robot.WaitIdle(180) # Wait up to 60 seconds for move to complete
 
     def move_EE_points(self, points):
         if not tools.robot_model_is_meca500(self.robot.GetRobotInfo().robot_model):
@@ -331,7 +332,7 @@ class RobotManager:
         for idx, pose in enumerate(points):
             self.logger.info(f'Moving to EE pose {idx+1}: {pose}')
             self.robot.MovePose(*pose)
-            self.robot.WaitIdle(60)
+            self.robot.WaitIdle(180)
 
 
 # ============================================================
@@ -370,6 +371,10 @@ def main():
 
                 logging.info("Starting robot movement...")
                 manager.move_angle_points([
+                    # # 눈 트로카 진입
+                    # (51.093, -0.2565, 27.4365, -1.001, 24.416, -34.72),
+                    # (51.045512, 6.187758, 28.528616, -1.326412, 16.839833, -34.399135),
+                    # White silcone 정 중앙 진입
                     (-0.338223, 1.107869, -2.314018, -0.304322, 70.844049, -2.447558),
                     (1.439584, 7.482698, 5.040527, -0.815003, 59.736926, -0.392272)
                 ])
@@ -384,7 +389,11 @@ def main():
                 # Move back and to noisy home AFTER signaling stop
                 # This ensures the threads capture the end of the main movement
                 logging.info("Moving back to initial position...")
+                manager.robot.SetJointVel(2)
                 manager.move_angle_points([
+                    # 눈 트로카 후퇴
+                    # (51.093, -0.2565, 27.4365, -1.001, 24.416, -34.72),
+                    # White silcone 정 중앙 후퇴
                     (-0.338223, 1.107869, -2.314018, -0.304322, 70.844049, -2.447558)
                 ])
                 noise = random.uniform(-15.0, 15.0)
