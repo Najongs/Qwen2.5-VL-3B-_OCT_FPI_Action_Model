@@ -28,14 +28,16 @@ ZMQ_PUB_PORT = 5556 # Choose a port for ZMQ
 SENDER_RATE_HZ = 100 # How often to send ZMQ messages
 ZMQ_TOPIC = b"robot_state" # Topic for subscribers to filter
 
-# --- [수정됨] ---
-# Packet Structure (Essential Data Only)
-# Header: ts (double), send_ts (double), force (float)
-# Data: joints (6 floats), pose (6 floats)
-PACKET_FORMAT = '<ddf12f' # Format string for the entire payload
-TOTAL_PAYLOAD_SIZE = struct.calcsize(PACKET_FORMAT) # 8+8+4 + 12*4 = 20 + 48 = 68 bytes
-# --- [NXZRt 관련 상수 제거됨] ---
-# =========================
+# 데이터 포맷 (C++ receiver와 일치)
+# Format: <ddf12f
+# - origin_timestamp: double (8 bytes)
+# - send_timestamp: double (8 bytes)
+# - force: float (4 bytes)
+# - joints[6]: float (24 bytes)
+# - pose[6]: float (24 bytes)
+# Total: 68 bytes
+PAYLOAD_FORMAT = '<ddf12f'
+PAYLOAD_SIZE = struct.calcsize(PAYLOAD_FORMAT)
 
 # ============================================================
 # 1️⃣ Global Clock (유지)
@@ -131,13 +133,6 @@ class RtSampler(threading.Thread):
                          print(f"[RtSampler WARN] Loop falling behind by {-sleep_dt*1000:.1f} ms")
         print(f"✅ Robot data sampling stopped.")
 
-
-# ============================================================
-# 🆕 ZeroMQ Publisher Thread (수정됨 - 패딩 제거) 🆕
-# ============================================================
-# ============================================================
-# 🆕 ZeroMQ Publisher Thread (수정됨 - dummy_sock 오류 수정) 🆕
-# ============================================================
 class ZmqPublisher(threading.Thread):
     def __init__(self, sampler, clock, address, port, stop_event, rate_hz=100):
         super().__init__(daemon=True)
@@ -154,7 +149,7 @@ class ZmqPublisher(threading.Thread):
         self.socket.setsockopt(zmq.LINGER, 500)
         self.socket.bind(bind_addr)
         print(f"✅ ZMQ Publisher bound to {bind_addr} at {rate_hz} Hz.")
-        print(f"   Topic: '{ZMQ_TOPIC.decode()}', Payload Size: {TOTAL_PAYLOAD_SIZE} bytes")
+        print(f"   Topic: '{ZMQ_TOPIC.decode()}', Payload Size: {PAYLOAD_SIZE} bytes")
 
     def run(self):
         next_send_time = time.time()
@@ -184,9 +179,9 @@ class ZmqPublisher(threading.Thread):
                     send_ts = time.time()
 
                     try:
-                        payload_bytes = struct.pack(PACKET_FORMAT, ts, send_ts, force, *q, *p)
+                        payload_bytes = struct.pack(PAYLOAD_FORMAT, ts, send_ts, force, *q, *p)
 
-                        if len(payload_bytes) != TOTAL_PAYLOAD_SIZE:
+                        if len(payload_bytes) != PAYLOAD_SIZE:
                             print(f"[ZmqPublisher ERR] Payload size mismatch!")
                             continue
 
